@@ -1,0 +1,449 @@
+<?php
+/**
+ * Clase para manejar la desactivación de caché para bots/LLMs
+ *
+ * @package Content_Trace_Cleaner
+ */
+
+defined('ABSPATH') || exit;
+
+/**
+ * Clase Content_Trace_Cleaner_Cache
+ */
+class Content_Trace_Cleaner_Cache {
+
+    /**
+     * Instancia única (Singleton)
+     */
+    private static $instance = null;
+
+    /**
+     * Lista de bots/LLMs comunes
+     */
+    private $default_bots = array(
+        'chatgpt',
+        'claude',
+        'bard',
+        'gpt',
+        'openai',
+        'anthropic',
+        'googlebot',
+        'bingbot',
+        'crawler',
+        'spider',
+        'bot',
+        'llm',
+        'grok',
+    );
+
+    /**
+     * Obtener instancia única
+     */
+    public static function get_instance() {
+        if (null === self::$instance) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
+
+    /**
+     * Constructor
+     */
+    private function __construct() {
+        // Inicializar hooks temprano para evitar caché
+        add_action('init', array($this, 'disable_cache_for_bots'), 1);
+
+        // Hooks específicos para diferentes plugins de caché
+        add_filter('litespeed_cache_check_cookies', array($this, 'litespeed_bypass_for_bots'), 10, 1);
+        add_action('litespeed_init', array($this, 'litespeed_control_init'));
+        add_filter('do_rocket_generate_caching_files', array($this, 'exclude_bots_from_wp_rocket'));
+        add_filter('w3tc_can_cache', array($this, 'w3tc_exclude_bots'), 10, 1);
+        add_filter('wp_cache_themes_persist', array($this, 'wp_super_cache_exclude_bots'), 10, 1);
+    }
+
+    /**
+     * Obtener User-Agent efectivo
+     *
+     * @return string User-Agent
+     */
+    private function get_effective_user_agent() {
+        if (isset($_SERVER['HTTP_USER_AGENT'])) {
+            return $_SERVER['HTTP_USER_AGENT'];
+        }
+
+        if (isset($_SERVER['HTTP_X_ORIGINAL_USER_AGENT'])) {
+            return $_SERVER['HTTP_X_ORIGINAL_USER_AGENT'];
+        }
+
+        if (isset($_SERVER['HTTP_X_FORWARDED_FOR_USER_AGENT'])) {
+            return $_SERVER['HTTP_X_FORWARDED_FOR_USER_AGENT'];
+        }
+
+        return '';
+    }
+
+    /**
+     * Detectar si es un iPhone sin JavaScript (posible Grok u otro LLM)
+     *
+     * @param string $ua User-Agent
+     * @return bool
+     */
+    private function is_iphone_no_js_llm($ua) {
+        if (stripos($ua, 'iphone') === false) {
+            return false;
+        }
+
+        $browser_indicators = array('safari', 'chrome', 'firefox', 'opera', 'edge', 'version');
+        foreach ($browser_indicators as $indicator) {
+            if (stripos($ua, $indicator) !== false) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Obtener lista de bots configurados
+     *
+     * @return array Lista de bots
+     */
+    private function get_configured_bots() {
+        $bots = array();
+
+        $selected_bots = get_option('content_trace_cleaner_selected_bots', array());
+        if (is_array($selected_bots)) {
+            $bots = array_merge($bots, $selected_bots);
+        }
+
+        $custom_bots = get_option('content_trace_cleaner_custom_bots', '');
+        if (!empty($custom_bots)) {
+            $custom_list = array_filter(array_map('trim', explode("\n", $custom_bots)));
+            $bots = array_merge($bots, $custom_list);
+        }
+
+        if (empty($bots)) {
+            $bots = $this->default_bots;
+        }
+
+        return array_unique(array_filter($bots));
+    }
+
+    /**
+     * Verificar si el User-Agent es un bot configurado
+     *
+     * @param string $ua User-Agent (opcional)
+     * @return bool
+     */
+    public function is_bot($ua = null) {
+        if ($ua === null) {
+            $ua = strtolower($this->get_effective_user_agent());
+        } else {
+            $ua = strtolower($ua);
+        }
+
+        if (empty($ua)) {
+            return false;
+        }
+
+        $disable_cache = get_option('content_trace_cleaner_disable_cache', false);
+        if (!$disable_cache) {
+            return false;
+        }
+
+        $allowed_bots = $this->get_configured_bots();
+
+        foreach ($allowed_bots as $bot) {
+            if (!empty($bot) && stripos($ua, $bot) !== false) {
+                return true;
+            }
+        }
+
+        if ($this->is_iphone_no_js_llm($ua)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Desactivar caché para bots
+     */
+    public function disable_cache_for_bots() {
+        if (defined('DOING_AJAX') && DOING_AJAX) {
+            return;
+        }
+
+        if (!$this->is_bot()) {
+            return;
+        }
+
+        // Desactivar todas las cachés de WordPress
+        if (!defined('DONOTCACHEPAGE')) {
+            define('DONOTCACHEPAGE', true);
+        }
+        if (!defined('DONOTCACHEOBJECT')) {
+            define('DONOTCACHEOBJECT', true);
+        }
+        if (!defined('DONOTCACHEDB')) {
+            define('DONOTCACHEDB', true);
+        }
+
+        // LiteSpeed Cache
+        if (!defined('LSCACHE_NO_CACHE')) {
+            define('LSCACHE_NO_CACHE', true);
+        }
+        do_action('litespeed_control_set_nocache', 'content-trace-cleaner: bot detected');
+
+        // NitroPack
+        if (!defined('NITROPACK_DISABLE_CACHE')) {
+            define('NITROPACK_DISABLE_CACHE', true);
+        }
+
+        // WP Rocket
+        if (!defined('DONOTROCKETOPTIMIZE')) {
+            define('DONOTROCKETOPTIMIZE', true);
+        }
+
+        // W3 Total Cache
+        if (!defined('DONOTMINIFY')) {
+            define('DONOTMINIFY', true);
+        }
+
+        // WP Super Cache
+        if (function_exists('wp_cache_no_cache_for_ip')) {
+            wp_cache_no_cache_for_ip();
+        }
+
+        // Añadir headers HTTP
+        if (!headers_sent()) {
+            header('Cache-Control: no-cache, no-store, must-revalidate, max-age=0');
+            header('Pragma: no-cache');
+            header('Expires: 0');
+            header('X-Content-Trace-Cleaner: Cache-Disabled');
+        }
+    }
+
+    /**
+     * Hook para LiteSpeed Cache - Bypass basado en cookies
+     *
+     * @param bool $can_cache Si se puede cachear
+     * @return bool
+     */
+    public function litespeed_bypass_for_bots($can_cache) {
+        if ($this->is_bot()) {
+            return false;
+        }
+        return $can_cache;
+    }
+
+    /**
+     * Hook para LiteSpeed Cache - Control de inicialización
+     */
+    public function litespeed_control_init() {
+        if ($this->is_bot()) {
+            do_action('litespeed_control_set_nocache', 'content-trace-cleaner: bot detected');
+        }
+    }
+
+    /**
+     * Hook para WP Rocket - Excluir bots de la caché
+     *
+     * @param bool $can_cache Si se puede cachear
+     * @return bool
+     */
+    public function exclude_bots_from_wp_rocket($can_cache) {
+        if ($this->is_bot()) {
+            return false;
+        }
+        return $can_cache;
+    }
+
+    /**
+     * Hook para W3 Total Cache - Excluir bots
+     *
+     * @param bool $can_cache Si se puede cachear
+     * @return bool
+     */
+    public function w3tc_exclude_bots($can_cache) {
+        if ($this->is_bot()) {
+            return false;
+        }
+        return $can_cache;
+    }
+
+    /**
+     * Hook para WP Super Cache - Excluir bots
+     *
+     * @param bool $persist Si debe persistir
+     * @return bool
+     */
+    public function wp_super_cache_exclude_bots($persist) {
+        if ($this->is_bot()) {
+            return false;
+        }
+        return $persist;
+    }
+
+    /**
+     * Desactivar caché durante el proceso de limpieza
+     */
+    public static function disable_cache_for_cleaning() {
+        if (!defined('DONOTCACHEPAGE')) {
+            define('DONOTCACHEPAGE', true);
+        }
+        if (!defined('DONOTCACHEOBJECT')) {
+            define('DONOTCACHEOBJECT', true);
+        }
+        if (!defined('DONOTCACHEDB')) {
+            define('DONOTCACHEDB', true);
+        }
+
+        if (!defined('LSCACHE_NO_CACHE')) {
+            define('LSCACHE_NO_CACHE', true);
+        }
+        do_action('litespeed_control_set_nocache', 'content-trace-cleaner: cleaning process');
+
+        if (!defined('NITROPACK_DISABLE_CACHE')) {
+            define('NITROPACK_DISABLE_CACHE', true);
+        }
+
+        if (!defined('DONOTROCKETOPTIMIZE')) {
+            define('DONOTROCKETOPTIMIZE', true);
+        }
+
+        if (!defined('DONOTMINIFY')) {
+            define('DONOTMINIFY', true);
+        }
+    }
+
+    /**
+     * Limpiar caché de un post específico después de modificarlo
+     *
+     * @param int $post_id ID del post
+     */
+    public static function clear_post_cache($post_id) {
+        if (empty($post_id)) {
+            return;
+        }
+
+        clean_post_cache($post_id);
+
+        // LiteSpeed Cache
+        if (class_exists('LiteSpeed_Cache_API')) {
+            LiteSpeed_Cache_API::purge_post($post_id);
+        }
+        if (function_exists('litespeed_purge_single_post')) {
+            litespeed_purge_single_post($post_id);
+        }
+
+        // WP Rocket
+        if (function_exists('rocket_clean_post')) {
+            rocket_clean_post($post_id);
+        }
+        if (function_exists('rocket_clean_domain')) {
+            rocket_clean_domain();
+        }
+
+        // W3 Total Cache
+        if (function_exists('w3tc_flush_post')) {
+            w3tc_flush_post($post_id);
+        }
+        if (function_exists('w3tc_pgcache_flush')) {
+            w3tc_pgcache_flush();
+        }
+
+        // WP Super Cache
+        if (function_exists('wp_cache_post_change')) {
+            wp_cache_post_change($post_id);
+        }
+
+        // NitroPack
+        if (function_exists('nitropack_sdk_purge')) {
+            nitropack_sdk_purge();
+        }
+        if (class_exists('NitroPack')) {
+            try {
+                $nitro = NitroPack::getInstance();
+                if (method_exists($nitro, 'purgeCache')) {
+                    $nitro->purgeCache();
+                }
+            } catch (Exception $e) {
+                // Silenciar errores de NitroPack
+            }
+        }
+
+        // Cache Enabler
+        if (function_exists('ce_clear_cache')) {
+            ce_clear_cache();
+        }
+
+        // Comet Cache
+        if (function_exists('comet_cache_clear_post_cache')) {
+            comet_cache_clear_post_cache($post_id);
+        }
+
+        // WP Fastest Cache
+        if (function_exists('wpfc_clear_post_cache_by_id')) {
+            wpfc_clear_post_cache_by_id($post_id);
+        }
+
+        // Autoptimize
+        if (function_exists('autoptimize_cache_flush')) {
+            autoptimize_cache_flush();
+        }
+    }
+
+    /**
+     * Limpiar toda la caché después del proceso de limpieza
+     */
+    public static function clear_all_cache() {
+        wp_cache_flush();
+
+        // LiteSpeed Cache
+        if (class_exists('LiteSpeed_Cache_API')) {
+            LiteSpeed_Cache_API::purge_all();
+        }
+        if (function_exists('litespeed_purge_all')) {
+            litespeed_purge_all();
+        }
+
+        // WP Rocket
+        if (function_exists('rocket_clean_domain')) {
+            rocket_clean_domain();
+        }
+        if (function_exists('flush_rocket_htaccess')) {
+            flush_rocket_htaccess();
+        }
+
+        // W3 Total Cache
+        if (function_exists('w3tc_flush_all')) {
+            w3tc_flush_all();
+        }
+
+        // WP Super Cache
+        if (function_exists('wp_cache_clear_cache')) {
+            wp_cache_clear_cache();
+        }
+
+        // NitroPack
+        if (function_exists('nitropack_sdk_purge')) {
+            nitropack_sdk_purge();
+        }
+
+        // Cache Enabler
+        if (function_exists('ce_clear_cache')) {
+            ce_clear_cache();
+        }
+
+        // Comet Cache
+        if (function_exists('comet_cache_clear')) {
+            comet_cache_clear();
+        }
+
+        // WP Fastest Cache
+        if (function_exists('wpfc_clear_all_cache')) {
+            wpfc_clear_all_cache(true);
+        }
+    }
+}
